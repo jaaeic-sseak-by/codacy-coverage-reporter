@@ -244,7 +244,7 @@ workflows:
           name: create_artifacts_for_osx
           cmd: |
             # TODO GraalVM version should be in a single place
-            export GRAAL_VERSION=20.0.0
+            export GRAAL_VERSION=20.2.0
             export TARGET_GRAAL="./target/graalvm-$GRAAL_VERSION.tar.gz"
             mkdir -p target
             if [[ ! -e $TARGET_GRAAL ]]; then

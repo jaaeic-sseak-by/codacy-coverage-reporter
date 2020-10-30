@@ -59,7 +59,7 @@ cancelable in Global := true
 javacOptions ++= Seq("-source", "11", "-target", "11")
 
 enablePlugins(GraalVMNativeImagePlugin)
-graalVMNativeImageGraalVersion := Some("20.0.0-java11")
+graalVMNativeImageGraalVersion := Some("20.2.0-java11")
 
 graalVMNativeImageOptions := Seq(
   "--verbose",
