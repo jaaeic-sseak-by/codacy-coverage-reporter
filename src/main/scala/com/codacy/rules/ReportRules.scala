@@ -3,21 +3,15 @@ package com.codacy.rules
 import java.io.File
 import java.nio.file.Files
 
-import com.codacy.api.CoverageReport
 import com.codacy.api.client.{FailedResponse, SuccessfulResponse}
 import com.codacy.api.helpers.FileHelper
 import com.codacy.api.service.CoverageServices
-import com.codacy.model.configuration.{
-  ApiTokenAuthenticationConfig,
-  BaseConfig,
-  FinalConfig,
-  ProjectTokenAuthenticationConfig,
-  ReportConfig
-}
+import com.codacy.api.{CoverageFileReport, CoverageReport}
+import com.codacy.model.configuration._
 import com.codacy.parsers.CoverageParser
-import com.codacy.transformation.PathPrefixer
 import com.codacy.plugins.api.languages.Languages
 import com.codacy.rules.commituuid.CommitUUIDProvider
+import com.codacy.transformation.PathPrefixer
 import wvlet.log.LogSupport
 
 import scala.collection.JavaConverters._
@@ -49,8 +43,8 @@ class ReportRules(coverageServices: => CoverageServices) extends LogSupport {
               transform(coverageResult.report)(finalConfig)
           }
           _ <- storeReport(report, file)
-          language <- guessReportLanguage(finalConfig.languageOpt, report)
-          success <- sendReport(report, language, finalConfig, commitUUID, file)
+          reportsGroupedByLanguage = reportsByLanguage(finalConfig.languageOpt, report)
+          success <- sendReport(report, reportsGroupedByLanguage, finalConfig, commitUUID, file)
         } yield { success }
       }
       .collectFirst {
@@ -133,7 +127,6 @@ class ReportRules(coverageServices: => CoverageServices) extends LogSupport {
     *
     * Send the parsed report to coverage services with the given language and commitUUID
     * @param report coverage report to be sent
-    * @param language language detected in files or specified by user input
     * @param config configuration
     * @param commitUUID unique id of commit being reported
     * @param file report file
@@ -141,52 +134,58 @@ class ReportRules(coverageServices: => CoverageServices) extends LogSupport {
     */
   private def sendReport(
       report: CoverageReport,
-      language: String,
+      reportFilesByLanguage: Seq[LanguageCoverageReportFiles],
       config: ReportConfig,
       commitUUID: String,
       file: File
   ) = {
-    val coverageResponse = config.baseConfig.authentication match {
-      case _: ProjectTokenAuthenticationConfig =>
-        coverageServices.sendReport(commitUUID, language, report, config.partial)
+    val coverageResponseSeq = reportFilesByLanguage.map { languageCoverageReportFiles =>
+      val coverageReport = CoverageReport(report.total, languageCoverageReportFiles.fileReport)
+      config.baseConfig.authentication match {
+        case _: ProjectTokenAuthenticationConfig =>
+          (
+            languageCoverageReportFiles.language,
+            coverageServices
+              .sendReport(commitUUID, languageCoverageReportFiles.language, coverageReport, config.partial)
+          )
 
-      case ApiTokenAuthenticationConfig(_, username, projectName) =>
-        coverageServices.sendReportWithProjectName(username, projectName, commitUUID, language, report, config.partial)
+        case ApiTokenAuthenticationConfig(_, username, projectName) =>
+          (
+            languageCoverageReportFiles.language,
+            coverageServices.sendReportWithProjectName(
+              username,
+              projectName,
+              commitUUID,
+              languageCoverageReportFiles.language,
+              coverageReport,
+              config.partial
+            )
+          )
+      }
     }
-    coverageResponse match {
-      case SuccessfulResponse(value) =>
-        logger.info(s"Coverage data uploaded. ${value.success}")
-        Right(())
-      case failed: FailedResponse =>
-        val message = handleFailedResponse(failed)
-        Left(s"Failed to upload coverage report ${file.getAbsolutePath}: $message")
-    }
+
+    coverageResponseSeq
+      .map {
+        case (language, SuccessfulResponse(value)) =>
+          logger.info(s"Coverage data uploaded for ${language}. ${value.success}")
+          Right(())
+        case (language, failed: FailedResponse) =>
+          val message = handleFailedResponse(failed)
+          logger.error(s"Coverage data failed to upload for ${language}.")
+          Left(s"Failed to upload coverage report ${file.getAbsolutePath}: $message")
+      }
+      .foldLeft[Either[String, Unit]](Right(())) {
+        case (l, value) if value.isRight => l
+        case (_, value) if value.isLeft => Left("Failed to upload some coverage reports")
+      }
   }
 
-  /**
-    * Guess report language
-    *
-    * This function try to guess the report language using the first filename on
-    * the report file.
-    * @param languageOpt language option provided by the config
-    * @param report coverage report
-    * @return the guessed language name on the right or an error on the left.
-    */
-  private[rules] def guessReportLanguage(
-      languageOpt: Option[String],
-      report: CoverageReport
-  ): Either[String, String] = {
-    languageOpt match {
-      case Some(l) => Right(l)
+  private[rules] def guessLanguageFromFilename(filename: String): Either[String, String] = {
+    Languages.forPath(filename) match {
       case None =>
-        report.fileReports.headOption match {
-          case None => Left("Can't guess the language due to empty coverage report")
-          case Some(fileReport) =>
-            Languages.forPath(fileReport.filename) match {
-              case None => Left("Can't guess the language due to invalid path")
-              case Some(value) => Right(value.toString)
-            }
-        }
+        logger.warn(s"Can't guess the language due to invalid path: $filename")
+        Left(s"Can't guess the language due to invalid path: $filename")
+      case Some(value) => Right(value.toString)
     }
   }
 
@@ -230,6 +229,40 @@ class ReportRules(coverageServices: => CoverageServices) extends LogSupport {
           Right(foundFiles)
       case value =>
         Right(value)
+    }
+  }
+
+  private[rules] def reportsByLanguage(
+      languageOpt: Option[String],
+      report: CoverageReport
+  ): Seq[LanguageCoverageReportFiles] = {
+    languageOpt match {
+      case Some(language) =>
+        Seq(LanguageCoverageReportFiles(language, report.fileReports))
+      case None =>
+        val fileReportWithLanguage = report.fileReports
+          .collect {
+            case fileReport =>
+              val languageEither = guessLanguageFromFilename(fileReport.filename)
+              languageEither match {
+                case Right(language) => (language, fileReport)
+              }
+          }
+
+        val languageCoverageReportFiles = fileReportWithLanguage
+          .groupBy {
+            case (language, _) => language
+          }
+          .map {
+            case (language, reports) =>
+              val coverageFileReportsForLanguage = reports.map {
+                case (_, coverageFileReport) => coverageFileReport
+              }
+              LanguageCoverageReportFiles(language, coverageFileReportsForLanguage)
+          }
+          .toSeq
+
+        languageCoverageReportFiles
     }
   }
 
@@ -291,3 +324,5 @@ class ReportRules(coverageServices: => CoverageServices) extends LogSupport {
   }
 
 }
+
+case class LanguageCoverageReportFiles(language: String, fileReport: Seq[CoverageFileReport])
